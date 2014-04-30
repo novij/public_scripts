@@ -1,0 +1,129 @@
+#!/bin/bash
+
+#set -x
+
+# Use this script to backup your Citrx Xen virutal machines as XVA on a
+# backup server or file server.
+# It creates one file per server, e.g. 'server-name.xva'
+# If a backup fails, the old file won't be overwritten.
+# At the first run, the script saves the SSH public key and the Xen server
+# credentials on the Xen server. The credentials are needed to download
+# the XVA file through HTTP.
+#
+#
+# Usage:
+# ./backup_xen xenhostname vm-id
+#
+# or create a file with one vm-id per line and optional comment, e.g.:
+# a777bf48-bdce-d286-9f06-1130c6295f8a    linux otrs
+# 2edaa605-c977-3d38-c42f-c354bdf163b8    citrix xen webservice
+# f53557b3-a808-afc9-e35d-9256c63cb795    windows ad
+#
+# ./backup_xen xenhostname /file-with-vm-ids
+
+# Author: Julian Golderer
+# Version: 1.0 (Halloween)
+
+# Changelog:
+# 31.10.2011 1.0 (Halloween)
+#   First Release!
+
+
+
+CURLCMD=/usr/bin/curl
+SSHKEY=/root/.ssh/xenbackup_rsa
+SSHBIN=/usr/bin/ssh
+DESTDIR=/var/xen-backups
+
+# check for first argument
+
+if [ -z $1 ]; then
+  echo "xen host missing"
+  exit 255
+fi
+
+# check for second argument
+
+if [ -z $2 ]; then
+  echo "vm uuid or path to file with uuids missing"
+  exit 255
+fi
+
+# check if ssh-key exists
+
+if [ ! -e "$SSHKEY" ]; then
+  echo "ssh key $SSHKEY missing"
+  exit 255
+fi
+
+# check if destination directory exists and is writeable
+
+if [ ! -d "$DESTDIR" ] || [ ! -w "$DESTDIR" ]; then
+  echo "destination directory $DESTDIR missing or not writeable"
+  exit 255
+fi
+
+# set ssh command
+
+SSHCMD="${SSHBIN} -i ${SSHKEY} root@${1}"
+
+# check if ssh pubkey exists in authorized key file on xen host
+
+read SSHPUBKEY < "${SSHKEY}.pub"
+$SSHCMD "/bin/grep -q \"${SSHPUBKEY}\" .ssh/authorized_keys || echo \"$SSHPUBKEY\" >> .ssh/authorized_keys"
+
+# check if xen credential file exists on xen host. this file is needed for downloading the xva image
+
+if ! XENCRED=$($SSHCMD "/bin/cat .xencredential"); then
+  echo "please enter xen password:"
+  read -r -s password
+  XENCRED="root:${password}"
+  $SSHCMD "echo \"${XENCRED}\" > .xencredential"
+fi
+
+# check if second argument is a file, else handle it as a vm-id
+
+if [ -r "$2" ]; then
+  while read line comment; do
+    VMIDS="${VMIDS} ${line}"
+  done < "$2"
+else
+  VMIDS="$2"
+fi
+
+# the main backup loop
+
+for VMID in ${VMIDS}; do
+
+# get vm name, strip spaces
+
+VMNAME=$($SSHCMD "xe vm-list uuid=${VMID}" | grep name-label | cut -d ':' -f 2 | tr -d ' ')
+
+# if uuid doesn't exists skip this entry
+
+if [ -z $VMNAME ]; then
+  echo "no such vm ${VMID}"
+  continue
+fi
+
+echo "start backup of ${VMNAME}"
+
+# create snapshot of vm
+
+SNAPSHOTID=$($SSHCMD "xe vm-snapshot vm=${VMID} new-name-label=${VMID}_backup")
+
+# set template flag to false
+
+$SSHCMD "xe template-param-set is-a-template=false uuid=${SNAPSHOTID}"
+
+# download xva image with curl into destination folder
+# after successfull download, rename it
+
+$CURLCMD --basic --user "${XENCRED}" --insecure --silent --output /${DESTDIR}/${VMNAME}.xva.part https://${1}/export?uuid=${SNAPSHOTID} && \
+mv "/${DESTDIR}/${VMNAME}.xva.part" "/${DESTDIR}/${VMNAME}.xva"
+
+# remove snapshot
+
+$SSHCMD "xe vm-uninstall force=true uuid=${SNAPSHOTID}"
+
+done
